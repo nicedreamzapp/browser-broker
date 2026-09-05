@@ -15,6 +15,25 @@ with lease("my-agent", url="https://mail.google.com", purpose="inbox sweep") as 
 
 The lease auto-renews while you work and releases on exit — including on an exception. A crashed agent frees its tab instead of stranding it.
 
+## Transparent mode — zero changes to any tool
+
+`proxy.py` *is* port 9222. The real browser runs on 9229 behind it. Every tool keeps dialing 9222 exactly as before and gets a browser in which the only tabs that exist are the ones it was given:
+
+```
+agent-browser --cdp 9222          ┐
+chrome-devtools-mcp --browser-url ├──▶  proxy :9222  ──▶  real browser :9229
+Playwright connectOverCDP         │     (ownership,        (your profile,
+curl /json → first page           │      focus-block,       your logins)
+raw websocket, browser-use …      ┘      off-screen park)
+```
+
+- A browser-level websocket is one client for as long as it stays connected; its tabs vanish when it goes away.
+- A legacy client that does `GET /json` and grabs the first page grabs its own fresh hidden tab — that is the only page in the list.
+- `Target.activateTarget`, `Page.bringToFront` and `/json/activate` are answered with success and never forwarded. Nothing an agent does can put it in front of you.
+- `Target.getTargets`, `setDiscoverTargets`, `attachToTarget`, auto-attach events: all filtered to the client's own targets. Your tabs and other agents' tabs are not merely off-limits, they do not exist from where the client stands.
+
+Verified with Playwright's `connect_over_cdp`, a raw "first page" websocket client, two concurrent browser-level clients, and the REST lease API — Gmail, LinkedIn and Yahoo Mail all loaded logged-in, in hidden windows, with the human's tabs untouched throughout.
+
 ## Why it works
 
 **The rule is deliberately dumb.** The broker only hands out tabs the broker opened. Anything the human opened is invisible to every agent, permanently, with no heuristics. Focus-detection was rejected on purpose — window checks false-negative across macOS Spaces, and a heuristic that's wrong once is worse than a rule that's boring. `/adopt` exists for deliberately driving an existing tab; you have to ask for it by name.
@@ -32,10 +51,12 @@ The lease auto-renews while you work and releases on exit — including on an ex
 ```bash
 git clone https://github.com/nicedreamzapp/browser-broker
 cd browser-broker
-./launch-browser.sh        # your real profile, with the flags the hidden window needs
-./install.sh               # LaunchAgent: starts at login, restarts if it dies
+./launch-browser.sh        # your real profile on :9229, with the flags the hidden window needs
+./install.sh               # LaunchAgent for proxy.py: :9222 for tools, :9223 lease API
 curl localhost:9223/status
 ```
+
+Already have a browser on 9222 that you can't restart right now? Run the proxy on another port for a look: `BROKER_PROXY_PORT=9224 BROKER_UPSTREAM_PORT=9222 BROKER_PORT=9225 python3 proxy.py`.
 
 Requires Python 3.9+ and `websocket-client` (the only dependency). Chrome works too: `BROWSER_APP="Google Chrome" ./launch-browser.sh`.
 
@@ -54,7 +75,7 @@ Requires Python 3.9+ and `websocket-client` (the only dependency). Chrome works 
 
 `ws_url` is a normal CDP page socket — drive it with the bundled client, Playwright's `connect_over_cdp`, or raw websockets. The broker doesn't proxy traffic; it just decides who's allowed in.
 
-Configuration is all environment: `BROKER_PORT` (9223), `BROKER_CDP_PORT` (9222), `BROKER_TTL`, `BROKER_HEARTBEAT`, `BROKER_HIDDEN_LEFT`, `BROKER_LOG`.
+Configuration is all environment: `BROKER_PROXY_PORT` (9222, what tools dial), `BROKER_UPSTREAM_PORT` (9229, the real browser), `BROKER_PORT` (9223, lease API), `BROKER_TTL`, `BROKER_HEARTBEAT`, `BROKER_HIDDEN_LEFT`, `BROKER_LOG`, `BROKER_DEBUG=1` for a handshake trace. `broker.py` is the earlier REST-only version and still runs standalone against a browser on 9222 (`BROKER_CDP_PORT`).
 
 ## Security
 

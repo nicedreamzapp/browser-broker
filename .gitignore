@@ -3,3 +3,5 @@ __pycache__/
 *.log
 launchd.err
 launchd.out
+proxy-test.out
+proxy-test.log

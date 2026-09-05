@@ -6,7 +6,7 @@
 # an off-screen window keep painting. Without them Chromium throttles occluded
 # windows and modern SPAs mount zero rows in the hidden tab.
 set -e
-PORT="${BROKER_CDP_PORT:-9222}"
+PORT="${BROKER_UPSTREAM_PORT:-9229}"   # the proxy owns 9222; the real browser hides behind it
 APP="${BROWSER_APP:-Brave Browser}"   # or "Google Chrome"
 
 if curl -sf -m 3 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then

@@ -8,7 +8,7 @@
 	<array>
 		<string>/usr/bin/env</string>
 		<string>python3</string>
-		<string>__BROKER_DIR__/broker.py</string>
+		<string>__BROKER_DIR__/proxy.py</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

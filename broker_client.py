@@ -19,7 +19,8 @@ from urllib.request import urlopen, Request
 
 from websocket import create_connection
 
-BROKER = "http://127.0.0.1:9223"
+import os
+BROKER = os.environ.get("BROKER_URL", "http://127.0.0.1:9223")
 RENEW_EVERY = 60
 TTL = 300
 
