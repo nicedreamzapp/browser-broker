@@ -7,6 +7,7 @@ None of this starts from scratch. Here's whose work this is built on.
 | 🌐 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) | Every tab the broker opens, parks, and reclaims | The Chromium team |
 | 🔌 [websocket-client](https://github.com/websocket-client/websocket-client) | The one dependency — the CDP socket | Hiroki Ohtani and contributors |
 | 🤖 [browser-agent](https://github.com/nicedreamzapp/browser-agent) | The agent this was built to keep out of the human's tabs | sibling project |
+| 🧠 [claude-code-local](https://github.com/nicedreamzapp/claude-code-local) | The local MLX brain those agents think with | sibling project |
 
 ---
 

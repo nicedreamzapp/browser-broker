@@ -64,7 +64,17 @@ Localhost only, no auth. Anything that can reach `127.0.0.1:9223` can drive your
 
 Built in one night on a Mac mini and proven with four tests: a hidden tab loading Gmail authenticated while the human's visible tab sat on a different account; two agents running concurrently on separate targets; a simulated agent crash whose lease expired and was reclaimed; the human's tab untouched throughout. Two production agents (a Yahoo inbox sweeper and a LinkedIn notification reaper) have been moved onto it, with a fallback to raw CDP if the broker is down. Not yet built: a lane router that skips the browser entirely when a job is really an API call, and per-domain serialization so two agents never hammer one site as the same user.
 
-Sibling project: [browser-agent](https://github.com/nicedreamzapp/browser-agent), the local MLX agent this was built to keep out of the human's tabs.
+## The local-first stack
+
+This is one piece of a set that runs entirely on your Mac, no cloud:
+
+| Project | Role | What it does |
+|---|---|---|
+| 🧠 [claude-code-local](https://github.com/nicedreamzapp/claude-code-local) | Brain | Claude Code on a local MLX model — the inference the agents think with |
+| 🌐 [browser-agent](https://github.com/nicedreamzapp/browser-agent) | Hands | Drives your real browser via CDP — iframes, Shadow DOM, ProseMirror |
+| 🚦 **browser-broker** | Traffic cop | Leases each agent its own hidden tab so hands never collide, or grab yours |
+
+Brain on `:4000`, browser on `:9222`, broker on `:9223` deciding who gets which tab.
 
 ## License
 
