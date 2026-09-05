@@ -76,6 +76,18 @@ This is one piece of a set that runs entirely on your Mac, no cloud:
 
 Brain on `:4000`, browser on `:9222`, broker on `:9223` deciding who gets which tab.
 
+## Prior art and neighbours
+
+This problem is being attacked from several directions right now. None of these are competitors so much as pieces of the same puzzle, and browser-broker borrows from the ideas in them:
+
+- [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) — `--cdp` mode with `--pin-tab` binds a session to one tab; [issue #1068](https://github.com/vercel-labs/agent-browser/issues/1068) asks for `Target.createBrowserContext` so parallel sessions get isolated cookies.
+- [leeguooooo/chrome-use](https://github.com/leeguooooo/chrome-use) — per-session coloured tab groups in your real Chrome, never force-fronts a tab.
+- [mediar-ai/playwright-mcp-orchestrator](https://github.com/mediar-ai/playwright-mcp-orchestrator) — one Chrome, many `@playwright/mcp` sessions, each scoped to its own tabs.
+- [henu-wang/chrome-mcp-proxy](https://github.com/henu-wang/chrome-mcp-proxy) and `chrome-devtools-mcp-mux` — proxies in front of `chrome-devtools-mcp` that block focus-stealing and give each client its own tabs.
+- [captivus/chrome-agent](https://github.com/captivus/chrome-agent), [pasky/chrome-cdp-skill](https://github.com/pasky/chrome-cdp-skill), [ofershap/real-browser-mcp](https://github.com/ofershap/real-browser-mcp) — drive your real, logged-in browser over CDP or an extension.
+
+What browser-broker adds is a layer that sits *below* all of them: it doesn't care which tool the agent is — a CLI, an MCP server, Playwright, raw websockets — because it hands out plain CDP page sockets. The ownership rule (agents only ever see tabs the broker opened) and the off-screen rendering window are the parts that don't exist elsewhere yet. If you maintain one of the projects above and want a lease layer under yours, open an issue.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Built on other people's work — see [CREDITS.md](CREDITS.md).
