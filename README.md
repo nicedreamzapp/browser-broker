@@ -37,7 +37,9 @@ cd browser-broker
 curl localhost:9223/status
 ```
 
-Requires macOS, Python 3.9+, and `websocket-client` (the only dependency). Chrome works too: `BROWSER_APP="Google Chrome" ./launch-browser.sh`.
+Requires Python 3.9+ and `websocket-client` (the only dependency). Chrome works too: `BROWSER_APP="Google Chrome" ./launch-browser.sh`.
+
+**Windows / Linux:** `broker.py` and `broker_client.py` are pure Python and don't care about the OS — only the two shell scripts are macOS. Launch Chrome or Brave yourself with `--remote-debugging-port=9222 --remote-allow-origins=* --disable-backgrounding-occluded-windows --disable-renderer-backgrounding`, then run `python broker.py` from a startup task. The off-screen window uses `Browser.setWindowBounds`, which is standard CDP. Tested on macOS only so far — reports welcome.
 
 ## API
 
