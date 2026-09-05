@@ -144,16 +144,16 @@ class Registry:
     # ---- leases --------------------------------------------------------
     def open_lease(self, owner, url, purpose, ttl, hidden=True):
         with self.lock:
-            first_hidden = hidden and self._hidden_window is None
+            # ALWAYS a new window. CDP cannot say which window a plain new tab
+            # lands in — it goes to the most recently active one, which after
+            # the human clicks is THEIR window — and parking "the window this
+            # tab is in" would then drag the human's window off-screen.
+            # One off-screen window per agent tab is cheap and safe.
             res = self.b.send("Target.createTarget", url=url or "about:blank",
-                              newWindow=bool(first_hidden), background=not first_hidden)
+                              newWindow=True, background=True)
             tid = res["targetId"]
             if hidden:
-                if first_hidden:
-                    self._hidden_window = self._park_offscreen(tid)
-                else:
-                    # Later tabs land in the same already-parked window.
-                    self._park_offscreen(tid)
+                self._hidden_window = self._park_offscreen(tid)
             self.owned[tid] = {"created": time.time(), "hidden": hidden}
             return self._grant(tid, owner, purpose, ttl)
 
