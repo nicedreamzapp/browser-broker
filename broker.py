@@ -17,11 +17,11 @@ heuristics involved. There is an /adopt escape hatch for the rare "drive this
 existing tab" case, and it requires saying so explicitly.
 
 Leases expire, so a crashed agent releases its tab instead of deadlocking the
-browser forever. Work tabs are parked in an off-screen window — a real window
-that renders normally (launch the browser with
---disable-backgrounding-occluded-windows and --disable-renderer-backgrounding,
-see launch-browser.sh — that is what makes an invisible window keep painting)
-but that the human never sees.
+browser forever. Work tabs are ordinary BACKGROUND tabs in the window the human
+already has open — never a separate window, never headless. Launch the browser
+with --disable-backgrounding-occluded-windows and --disable-renderer-backgrounding
+(see launch-browser.sh): Chromium throttles background tabs hard, and a throttled
+tab mounts zero rows in a modern SPA.
 
 Listens on 127.0.0.1:9223. Never exposed off the box.
 """
@@ -39,8 +39,6 @@ LISTEN = ("127.0.0.1", int(os.environ.get("BROKER_PORT", 9223)))
 DEFAULT_TTL = int(os.environ.get("BROKER_TTL", 300))          # seconds an unrenewed lease survives
 REAP_EVERY = 5                                                  # seconds between expiry sweeps
 HEARTBEAT_EVERY = int(os.environ.get("BROKER_HEARTBEAT", 3600)) # one proof-of-life line per hour
-HIDDEN_BOUNDS = {"left": int(os.environ.get("BROKER_HIDDEN_LEFT", -4200)), "top": 0,
-                 "width": 1440, "height": 900}
 LOG = os.path.expanduser(os.environ.get("BROKER_LOG",
                          os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.log")))
 
@@ -125,35 +123,20 @@ class Registry:
         self.lock = threading.RLock()
         self.owned = {}    # target_id -> {"created": ts, "hidden": bool}
         self.leases = {}   # lease_id -> {target_id, owner, purpose, expires}
-        self._hidden_window = None
-
-    # ---- hidden window -------------------------------------------------
-    def _park_offscreen(self, target_id):
-        """Move this target's window off-screen. It still renders; the human never sees it."""
-        try:
-            win = self.b.send("Browser.getWindowForTarget", targetId=target_id)
-            wid = win["windowId"]
-            self.b.send("Browser.setWindowBounds", windowId=wid,
-                        bounds={"windowState": "normal"})
-            self.b.send("Browser.setWindowBounds", windowId=wid, bounds=HIDDEN_BOUNDS)
-            return wid
-        except CDPError as e:
-            log(f"could not park window off-screen: {e}")
-            return None
 
     # ---- leases --------------------------------------------------------
     def open_lease(self, owner, url, purpose, ttl, hidden=True):
         with self.lock:
-            # ALWAYS a new window. CDP cannot say which window a plain new tab
-            # lands in — it goes to the most recently active one, which after
-            # the human clicks is THEIR window — and parking "the window this
-            # tab is in" would then drag the human's window off-screen.
-            # One off-screen window per agent tab is cheap and safe.
+            # An ordinary background tab in the window that is already open.
+            # This used to be a new window parked at x=-4200. It rendered fine
+            # and never took focus, but the window still EXISTED, so every agent
+            # run shoved the human's window aside -- twice over, with a broker
+            # on two machines. Isolation was never the window's job: the
+            # ownership registry plus the swallowed focus commands do that.
+            # background=True opens it behind whatever the human is looking at.
             res = self.b.send("Target.createTarget", url=url or "about:blank",
-                              newWindow=True, background=True)
+                              background=True)
             tid = res["targetId"]
-            if hidden:
-                self._hidden_window = self._park_offscreen(tid)
             self.owned[tid] = {"created": time.time(), "hidden": hidden}
             return self._grant(tid, owner, purpose, ttl)
 
@@ -237,7 +220,6 @@ class Registry:
                             "expires_in": round(l["expires"] - now, 1)}
                            for lid, l in self.leases.items()],
                 "broker_tabs": len(self.owned),
-                "hidden_window": self._hidden_window,
                 "brave_alive": self.b.alive(),
             }
 

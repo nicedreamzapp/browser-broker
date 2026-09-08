@@ -2,9 +2,10 @@
 # Launch Chrome or Brave with the flags browser-broker needs. Uses your REAL
 # profile, so every login you already have carries into the broker's tabs.
 #
-# The two --disable-*backgrounding* flags are not optional: they are what make
-# an off-screen window keep painting. Without them Chromium throttles occluded
-# windows and modern SPAs mount zero rows in the hidden tab.
+# The --disable-*backgrounding* flags are not optional. Agent tabs are ordinary
+# BACKGROUND tabs, and Chromium throttles those hard: timers stall and modern
+# SPAs mount zero rows in a tab that is not in front. These flags keep a
+# background tab painting exactly like the one you are looking at.
 set -e
 PORT="${BROKER_UPSTREAM_PORT:-9229}"   # the proxy owns 9222; the real browser hides behind it
 APP="${BROWSER_APP:-Brave Browser}"   # or "Google Chrome"

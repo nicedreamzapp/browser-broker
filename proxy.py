@@ -53,8 +53,6 @@ API = int(os.environ.get("BROKER_PORT", 9223))                   # REST lease AP
 DEFAULT_TTL = int(os.environ.get("BROKER_TTL", 300))
 UNATTACHED_TTL = 60          # a tab handed to a legacy client that never attached
 HEARTBEAT_EVERY = int(os.environ.get("BROKER_HEARTBEAT", 3600))
-HIDDEN_BOUNDS = {"left": int(os.environ.get("BROKER_HIDDEN_LEFT", -4200)), "top": 0,
-                 "width": 1440, "height": 900}
 LOG = os.path.expanduser(os.environ.get("BROKER_LOG",
       os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.log")))
 FOCUS_STEALERS = {"Target.activateTarget", "Page.bringToFront"}
