@@ -26,9 +26,10 @@ Identity comes for free from the connection:
 
 Focus-stealing commands (Target.activateTarget, Page.bringToFront,
 /json/activate) are answered with success and never forwarded, so no agent
-can bring itself in front of the human. Agent tabs live in their own windows
-parked off-screen — real windows that render normally because the browser is
-launched with backgrounding disabled (launch-browser.sh).
+can bring itself in front of the human. Agent tabs are ordinary background
+tabs in the window that is already open — they never take focus, and they
+keep rendering because the browser is launched with backgrounding disabled
+(launch-browser.sh).
 
 Ownership rule, deliberately dumb: this proxy can only hand out tabs it
 created. It never enumerates, attaches to, or closes anything else.
@@ -134,10 +135,14 @@ class Registry:
         self.loop = None
 
     async def create(self, owner, url, hidden=True, kind="rest", ttl=None):
-        # Always a fresh window: a plain new tab lands in the most recently
-        # active window, which after the human clicks is THEIRS.
+        # A plain background tab in the window that is already open. Matt asked
+        # for this on 2026-09-07: parking agent work in its own off-screen window
+        # shoved his browser aside every time an agent ran. background=True means
+        # it opens behind whatever he is looking at and never takes focus, and
+        # the ownership filter below -- not the window -- is what keeps agents
+        # out of each other's tabs, so nothing about the isolation changes.
         res = await self.up.send("Target.createTarget", url=url or "about:blank",
-                                 newWindow=True, background=True)
+                                 background=True)
         tid = res["targetId"]
         # Register ownership BEFORE parking the window: Chrome tells auto-attached
         # clients about the new target immediately, and their filter must be
@@ -146,15 +151,6 @@ class Registry:
                           "created": time.time(), "attached": 0,
                           "expires": time.time() + (ttl or UNATTACHED_TTL),
                           "lease_id": uuid.uuid4().hex[:12] if kind == "rest" else None}
-        if hidden:
-            try:
-                win = await self.up.send("Browser.getWindowForTarget", targetId=tid)
-                await self.up.send("Browser.setWindowBounds", windowId=win["windowId"],
-                                   bounds={"windowState": "normal"})
-                await self.up.send("Browser.setWindowBounds", windowId=win["windowId"],
-                                   bounds=HIDDEN_BOUNDS)
-            except Exception as e:
-                log(f"could not park window: {e}")
         log(f"tab {tid[:12]} -> {owner} ({kind}{', hidden' if hidden else ''})")
         return tid
 
