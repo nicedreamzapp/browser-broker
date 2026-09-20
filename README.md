@@ -80,6 +80,46 @@ The lease auto-renews while you work and releases on exit, including on an excep
 
 ---
 
+## 🎦 The stage: when an agent *does* want the screen
+
+Everything above is about keeping agents out of your way. Sometimes one genuinely has something
+to show you, and that is the opposite problem.
+
+There is no CDP call to intercept for this. `open -a "Brave Browser" <url>` and AppleScript
+`activate` are macOS calls, so swallowing `Target.activateTarget` does nothing about them. Two
+Claude Code sessions ran `open -a` four minutes apart on this machine and threw the window back
+and forth between them while the proxy sat there with a clean log.
+
+So the stage is a queue in front of the one door, and it is easier to use than the rude way:
+
+```bash
+bb-show https://example.com my-agent "why you are interrupting"
+```
+
+One agent holds the screen at a time. A second one waits its turn instead of yanking the window
+mid-sentence, and if the wait runs out it is told who has it and for how long, so it can print
+the link and move on rather than fight. Re-showing a page closes the stale copy first, so there
+is never a row of half-current duplicates of the same page.
+
+```
+A: HTTP 200 after 0.7s   shown
+B: HTTP 409 after 0.0s   stage held by agent-A for another 7.0s
+C: HTTP 200 after 7.9s   waited, then shown
+```
+
+| | |
+|---|---|
+| `POST /show` | `{owner, url, purpose, wait, dwell}` → `{shown, target_id, held_for}`, or `409` with `held_by` and `seconds_left` |
+| `POST /unstage` | drop the hold early |
+| `GET /stage` | who has the screen and what is on it |
+
+`BROKER_STAGE_DWELL` (20s, how long a shown page is protected) and `BROKER_STAGE_WAIT` (30s, how
+long a caller queues) tune it. This is cooperative: it works because the polite path is one word
+shorter than the rude one. On a machine running Claude Code you can make it binding with a
+`PreToolUse` hook that denies `open -a <browser>` and points at `bb-show` instead.
+
+---
+
 ## 📡 API
 
 | | |

@@ -34,7 +34,7 @@ keep rendering because the browser is launched with backgrounding disabled
 Ownership rule, deliberately dumb: this proxy can only hand out tabs it
 created. It never enumerates, attaches to, or closes anything else.
 """
-import asyncio, json, os, sys, time, uuid, threading
+import asyncio, json, os, sys, time, uuid, threading, subprocess
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -56,6 +56,9 @@ HEARTBEAT_EVERY = int(os.environ.get("BROKER_HEARTBEAT", 3600))
 LOG = os.path.expanduser(os.environ.get("BROKER_LOG",
       os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.log")))
 FOCUS_STEALERS = {"Target.activateTarget", "Page.bringToFront"}
+BROWSER_APP = os.environ.get("BROWSER_APP", "Brave Browser")   # for the one allowed activate
+STAGE_DWELL = int(os.environ.get("BROKER_STAGE_DWELL", 20))    # seconds a shown page is protected
+STAGE_WAIT = int(os.environ.get("BROKER_STAGE_WAIT", 30))      # seconds a caller will queue
 
 
 def log(msg):
@@ -207,8 +210,120 @@ class Registry:
                 "devtoolsFrontendUrl": f"/devtools/inspector.html?ws=127.0.0.1:{LISTEN}/devtools/page/{tid}"}
 
 
+
+# ---------------------------------------------------------------------------
+# the stage: the human's screen, held by one agent at a time
+# ---------------------------------------------------------------------------
+class StageBusy(Exception):
+    def __init__(self, holder, seconds_left, url):
+        self.holder, self.seconds_left, self.url = holder, seconds_left, url
+        super().__init__(f"stage held by {holder} for another {seconds_left}s")
+
+
+class Stage:
+    """Everything else in this file exists to keep agents OUT of the human's way.
+
+    This is the opposite: the one path that deliberately interrupts him, for the
+    times an agent genuinely has something to show. Because it is an interruption,
+    it is the one thing that has to take turns.
+
+    Two Claude Code sessions ran `open -a "Brave Browser" <url>` four minutes
+    apart on 2026-09-20 and threw Matt's window back and forth between them. The
+    proxy never saw it: `open -a` and AppleScript `activate` are macOS calls, not
+    CDP, so swallowing Target.activateTarget did nothing. The fix is not to try to
+    intercept them, which is not possible from here. It is to make a queued path
+    that is easier to use than the rude one, and to make the rude one loud.
+
+    Holding the stage does not block the caller: show() returns as soon as the
+    page is up, and the hold decays on its own. A second agent that arrives while
+    the page is fresh waits its turn instead of yanking the window mid-sentence.
+    """
+
+    def __init__(self, up):
+        self.up = up
+        self._lock = asyncio.Lock()
+        self._serial = 0
+        self.holder = None
+        self.url = None
+        self.purpose = None
+        self.until = 0
+        self.tab = None          # the one tab the stage keeps current
+
+    def state(self):
+        left = round(max(0.0, self.until - time.time()), 1)
+        return {"held_by": self.holder if left else None, "showing": self.url if left else None,
+                "purpose": self.purpose if left else None, "seconds_left": left,
+                "tab": (self.tab or "")[:12] or None}
+
+    async def _front(self, tid):
+        """Bring the page, and on macOS the app, to the front. Exactly once.
+
+        This is the only place in the project allowed to do this, which is the
+        whole point: one door, with a queue in front of it.
+        """
+        try:
+            await self.up.send("Target.activateTarget", targetId=tid)
+        except Exception as e:
+            log(f"stage: activateTarget failed ({e})")
+        if sys.platform == "darwin":
+            try:
+                pr = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", f'tell application "{BROWSER_APP}" to activate',
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                await asyncio.wait_for(pr.wait(), 5)
+            except Exception as e:
+                log(f"stage: activate failed ({e})")
+
+    async def show(self, owner, url, purpose=None, wait=None, dwell=None):
+        wait = STAGE_WAIT if wait is None else int(wait)
+        dwell = STAGE_DWELL if dwell is None else int(dwell)
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=max(0, wait))
+        except asyncio.TimeoutError:
+            raise StageBusy(self.holder, round(max(0.0, self.until - time.time()), 1), self.url)
+
+        self._serial += 1
+        mine = self._serial
+        self.holder, self.url, self.purpose = owner, url, purpose
+        self.until = time.time() + dwell
+
+        # Matt's rule, 2026-09-16: re-showing a page closes the old tab first, so
+        # there is never a row of half-stale copies of the same page to pick from.
+        # Only ever the stage's own tab -- a tab the human opened is not ours.
+        if self.tab:
+            try:
+                await self.up.send("Target.closeTarget", targetId=self.tab)
+            except Exception:
+                pass
+            self.tab = None
+
+        res = await self.up.send("Target.createTarget", url=url, background=False)
+        self.tab = res["targetId"]
+        await self._front(self.tab)
+        log(f"stage -> {owner}: {url} ({purpose or 'no purpose given'}), held {dwell}s")
+        asyncio.create_task(self._decay(mine, dwell))
+        return {"shown": url, "target_id": self.tab, "held_for": dwell, "owner": owner}
+
+    async def _decay(self, serial, dwell):
+        await asyncio.sleep(dwell)
+        self.free(serial)
+
+    def free(self, serial=None):
+        if serial is not None and serial != self._serial:
+            return False                      # someone else's turn by now
+        if self._lock.locked():
+            self.holder = None
+            self.url = None
+            self.purpose = None
+            self.until = 0
+            self._lock.release()
+            return True
+        return False
+
+
 REG: Registry = None
 UP: Upstream = None
+STAGE: Stage = None
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +614,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _run(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(30)
+    def _run(self, coro, timeout=30):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
 
     def do_GET(self):
         if self.path.startswith("/status"):
@@ -512,6 +627,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             return self._reply(200, s)
         if self.path.startswith("/health"):
             return self._reply(200, {"ok": True, "brave": self._run(UP.alive())})
+        if self.path.startswith("/stage"):
+            return self._reply(200, STAGE.state())
         self._reply(404, {"error": "no such endpoint"})
 
     def do_POST(self):
@@ -540,6 +657,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                         self._run(REG.close(tid, "released"))
                         return self._reply(200, {"released": b["lease_id"]})
                 return self._reply(404, {"error": "unknown lease"})
+            if self.path.startswith("/show"):
+                if not b.get("url"):
+                    return self._reply(400, {"error": "show needs a url"})
+                try:
+                    wait = STAGE_WAIT if b.get("wait") is None else int(b["wait"])
+                    return self._reply(200, self._run(STAGE.show(
+                        b.get("owner", "anonymous"), b["url"], b.get("purpose"),
+                        wait, b.get("dwell")), timeout=wait + 15))
+                except StageBusy as e:
+                    return self._reply(409, {"error": str(e), "held_by": e.holder,
+                                             "seconds_left": e.seconds_left, "showing": e.url})
+            if self.path.startswith("/unstage"):
+                return self._reply(200, {"freed": STAGE.free()})
             if self.path.startswith("/adopt"):
                 return self._reply(410, {"error": "adopt is not supported by the proxy — agents only ever get tabs the broker made"})
             self._reply(404, {"error": "no such endpoint"})
@@ -562,7 +692,7 @@ async def background():
 
 
 async def main():
-    global REG, UP
+    global REG, UP, STAGE
     UP = Upstream()
     try:
         await UP.connect()
@@ -571,6 +701,7 @@ async def main():
             f"--remote-debugging-port={UPSTREAM} first (see launch-browser.sh)")
         sys.exit(1)
     REG = Registry(UP)
+    STAGE = Stage(UP)
     loop = asyncio.get_running_loop()
     ApiHandler.loop = loop
     api = ThreadingHTTPServer(("127.0.0.1", API), ApiHandler)

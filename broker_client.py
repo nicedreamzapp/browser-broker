@@ -16,6 +16,7 @@ tab happens to match, which may be the one the human is reading.
 import json, threading, time
 from contextlib import contextmanager
 from urllib.request import urlopen, Request
+from urllib.error import HTTPError
 
 from websocket import create_connection
 
@@ -96,3 +97,36 @@ def lease(owner, url=None, purpose=None, hidden=True, ttl=TTL):
             _post("/release", {"lease_id": g["lease_id"]})
         except Exception:
             pass  # the reaper will collect it
+
+
+def show(url, owner=None, purpose=None, wait=None, dwell=None):
+    """Put a page in front of the human, taking turns with every other agent.
+
+    Use this instead of `open -a "Brave Browser" <url>` or AppleScript activate.
+    Those go straight to macOS, around the proxy, and two agents doing it minutes
+    apart is what throws his window back and forth. This queues.
+
+    Returns the broker's reply. Raises RuntimeError if the screen was busy for
+    longer than `wait` -- print the URL and move on rather than forcing it.
+    """
+    body = {"owner": owner or os.environ.get("BROKER_OWNER") or "anonymous", "url": url,
+            "purpose": purpose}
+    if wait is not None:
+        body["wait"] = wait
+    if dwell is not None:
+        body["dwell"] = dwell
+    try:
+        return _post("/show", body)
+    except HTTPError as e:
+        if e.code == 409:
+            d = json.loads(e.read() or b"{}")
+            raise RuntimeError(
+                f"screen busy: {d.get('held_by')} is showing {d.get('showing')} "
+                f"for another {d.get('seconds_left')}s") from None
+        raise
+
+
+def stage():
+    """Who has the screen right now, and what is on it."""
+    with urlopen(BROKER + "/stage", timeout=10) as r:
+        return json.load(r)
