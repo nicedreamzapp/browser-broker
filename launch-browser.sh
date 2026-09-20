@@ -3,9 +3,13 @@
 # profile, so every login you already have carries into the broker's tabs.
 #
 # The --disable-*backgrounding* flags are not optional. Agent tabs are ordinary
-# BACKGROUND tabs, and Chromium throttles those hard: timers stall and modern
-# SPAs mount zero rows in a tab that is not in front. These flags keep a
-# background tab painting exactly like the one you are looking at.
+# BACKGROUND tabs, and Chromium throttles those hard: timers drop to about 1Hz and
+# modern SPAs mount zero rows in a tab that is not in front. These flags keep a
+# background tab's timers and fetch callbacks running at full speed.
+#
+# They do NOT make a hidden tab paint. requestAnimationFrame does not fire while
+# visibilityState is "hidden" -- that is Page Visibility behaviour, not throttling.
+# A page that draws inside a rAF loop will sit at its first frame in an agent tab.
 set -e
 PORT="${BROKER_UPSTREAM_PORT:-9229}"   # the proxy owns 9222; the real browser hides behind it
 APP="${BROWSER_APP:-Brave Browser}"   # or "Google Chrome"

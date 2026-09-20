@@ -20,8 +20,11 @@ Leases expire, so a crashed agent releases its tab instead of deadlocking the
 browser forever. Work tabs are ordinary BACKGROUND tabs in the window the human
 already has open — never a separate window, never headless. Launch the browser
 with --disable-backgrounding-occluded-windows and --disable-renderer-backgrounding
-(see launch-browser.sh): Chromium throttles background tabs hard, and a throttled
-tab mounts zero rows in a modern SPA.
+(see launch-browser.sh): Chromium throttles background-tab timers to about 1Hz, and
+a throttled tab mounts zero rows in a modern SPA. The flags keep timers and fetch
+callbacks running; they do NOT make a hidden tab paint. requestAnimationFrame never
+fires while visibilityState is "hidden", so a rAF-driven page (canvas, animated
+charts) stays on its first frame no matter what flags you pass.
 
 Listens on 127.0.0.1:9223. Never exposed off the box.
 """
