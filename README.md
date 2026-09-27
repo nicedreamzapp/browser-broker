@@ -5,7 +5,7 @@
 ### Your second agent just stole the tab your first one was using.
 
 **One logged-in browser · many agents · nobody fights, and nobody touches your tabs**
-**~300 lines · one dependency · it *is* port 9222, so no tool changes a single line**
+**one Python proxy · it *is* port 9222, so no tool changes a single line**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-6366f1.svg?style=for-the-badge)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-22c55e.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
@@ -13,6 +13,25 @@
 [![Self-hosted](https://img.shields.io/badge/local-only-22c55e?style=for-the-badge)](#security)
 
 </div>
+
+**browser-broker is a local proxy that sits on Chrome's debug port (9222) and gives each AI agent its own private tab in your real, logged-in browser, so agents cannot see or steal each other's tabs or yours.**
+
+Proof in this repo: the Linux isolation check in [issue #1](https://github.com/nicedreamzapp/browser-broker/issues/1) (two clients, each blind to the other's tabs, checked in both directions), the stage timing run in [🎦 The stage](#the-stage), and the manual test runs listed under [📊 Status](#status). There is no automated test suite yet.
+
+---
+
+## 🛠️ What I built
+
+Designed and written by Matt Macosko:
+
+- [`proxy.py`](proxy.py): the transparent CDP proxy on :9222. Filters `Target.*` calls and events down to the caller's own tabs, swallows focus-stealing commands, ties tab ownership to the client connection, and serves the REST lease API and the stage on :9223. This is what the installer runs.
+- [`broker_client.py`](broker_client.py): the Python client. `lease()` context manager with auto-renew and release-on-exit, plus `show()` and `stage()`.
+- [`bb-show`](bb-show): the shell command agents use to ask for the screen instead of `open -a`.
+- [`hooks-example-focus-guard.py`](hooks-example-focus-guard.py): an example Claude Code `PreToolUse` hook that redirects `open -a <browser>` and AppleScript `activate` to `bb-show`.
+- [`broker.py`](broker.py): the first version, a standalone lease broker with `/adopt`. Kept for reference; the installer does not run it.
+- [`get.sh`](get.sh), [`install.sh`](install.sh), [`launch-browser.sh`](launch-browser.sh), [`launchd/com.browser-broker.plist`](launchd/com.browser-broker.plist): the macOS one-line installer, browser launcher and LaunchAgent.
+
+Upstream, not mine: the [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) and the Chrome/Brave browsers (Chromium team), and the [`websockets`](https://github.com/python-websockets/websockets) and [`websocket-client`](https://github.com/websocket-client/websocket-client) Python libraries. See [CREDITS.md](CREDITS.md).
 
 ---
 
@@ -70,17 +89,17 @@ The lease auto-renews while you work and releases on exit, including on an excep
 
 **Agent tabs are ordinary background tabs.** In your window, behind what you are looking at. No second window, nothing parked off-screen, nothing headless — headless can't use the profile that has your logins, and a stray window just shoves yours aside. Isolation was never the window's job: the ownership registry and the swallowed focus commands do all of it.
 
-**The rule is deliberately dumb.** Agents only ever get tabs the broker opened. Anything *you* opened is invisible to every agent, permanently, with no heuristics. Focus detection was rejected on purpose — window checks false-negative across macOS Spaces, and a heuristic that is wrong once is worse than a rule that is boring. `/adopt` exists for deliberately driving an existing tab; you have to ask for it by name.
+**The rule is deliberately dumb.** Agents only ever get tabs the broker opened. Anything *you* opened is invisible to every agent, permanently, with no heuristics. Focus detection was rejected on purpose — window checks false-negative across macOS Spaces, and a heuristic that is wrong once is worse than a rule that is boring. The proxy has no way around this: its `/adopt` answers `410`. Only the older standalone [`broker.py`](broker.py) can adopt an existing tab, and only when asked by name.
 
 **Leases expire.** 300 s by default, auto-renewed every 60 s by the client, reaped every 5 s. No deadlocks.
 
-**It reconnects.** Browsers auto-update, crash, get quit. Every CDP call retries once on a fresh connection.
+**It reconnects.** Browsers auto-update, crash, get quit. If the proxy's control socket to the browser drops, the next call opens a fresh one, and the LaunchAgent restarts the proxy if it exits.
 
 **It has a heartbeat.** One log line an hour. A silent daemon is indistinguishable from a dead one.
 
 ---
 
-## 🎦 The stage: when an agent *does* want the screen
+## <a name="the-stage"></a>🎦 The stage: when an agent *does* want the screen
 
 Everything above is about keeping agents out of your way. Sometimes one genuinely has something
 to show you, and that is the opposite problem.
@@ -116,7 +135,10 @@ C: HTTP 200 after 7.9s   waited, then shown
 `BROKER_STAGE_DWELL` (20s, how long a shown page is protected) and `BROKER_STAGE_WAIT` (30s, how
 long a caller queues) tune it. This is cooperative: it works because the polite path is one word
 shorter than the rude one. On a machine running Claude Code you can make it binding with a
-`PreToolUse` hook that denies `open -a <browser>` and points at `bb-show` instead.
+`PreToolUse` hook that denies `open -a <browser>` and points at `bb-show` instead;
+[`hooks-example-focus-guard.py`](hooks-example-focus-guard.py) is one (its shebang and log path are
+from the author's machine, so adjust them). If the broker is down, `bb-show` falls back to a plain
+`open -a`, which is macOS only.
 
 ---
 
@@ -127,11 +149,11 @@ shorter than the rude one. On a machine running Claude Code you can make it bind
 | `POST /lease` | `{owner, url, purpose, ttl}` → `{lease_id, target_id, ws_url, expires_in}` |
 | `POST /renew` | `{lease_id, ttl}` |
 | `POST /release` | `{lease_id, close}` — closes the tab unless `close: false` |
-| `POST /adopt` | `{owner, target_id, purpose, ttl}` — take over an existing tab, explicitly |
+| `POST /adopt` | returns `410` on the proxy. Only the older [`broker.py`](broker.py) supports it |
 | `GET /status` | who holds what, for how long, and whether the browser is alive |
 | `GET /health` | |
 
-`ws_url` is a normal CDP page socket — drive it with the bundled client, Playwright's `connect_over_cdp`, or raw websockets. The broker doesn't proxy your traffic; it decides who is allowed in.
+`ws_url` is a normal CDP page socket on the proxy's port (`ws://127.0.0.1:9222/devtools/page/<id>`). Drive it with the bundled client, Playwright's `connect_over_cdp`, or raw websockets. The traffic goes through the proxy, which is how it enforces who is allowed in.
 
 Everything is configured by environment: `BROKER_PROXY_PORT` (9222, what tools dial), `BROKER_UPSTREAM_PORT` (9229, your real browser), `BROKER_PORT` (9223, lease API), `BROKER_TTL`, `BROKER_HEARTBEAT`, `BROKER_LOG`, and `BROKER_DEBUG=1` for a handshake trace.
 
@@ -147,6 +169,7 @@ Or by hand:
 
 ```bash
 git clone https://github.com/nicedreamzapp/browser-broker && cd browser-broker
+pip3 install websockets websocket-client
 ./launch-browser.sh   # your real profile, CDP on :9229
 ./install.sh          # LaunchAgent for proxy.py: :9222 for tools, :9223 lease API
 curl localhost:9223/status
@@ -155,21 +178,21 @@ curl localhost:9223/status
 Already have something on 9222 you can't restart? Try it on another port first:
 `BROKER_PROXY_PORT=9224 BROKER_UPSTREAM_PORT=9222 BROKER_PORT=9225 python3 proxy.py`
 
-Python 3.9+ and `websocket-client`, which is the only dependency. Chrome as well as Brave: `BROWSER_APP="Google Chrome" ./launch-browser.sh`.
+Python 3.9+. `proxy.py` needs [`websockets`](https://github.com/python-websockets/websockets) (13 or newer, for `websockets.asyncio`); `broker_client.py` and `broker.py` need `websocket-client`. **Known gap:** `get.sh` and `install.sh` only install `websocket-client`, so run `pip3 install websockets` yourself or the LaunchAgent will fail to start the proxy. Brave is the default; for Chrome: `BROWSER_APP="Google Chrome" ./launch-browser.sh`.
 
-**Windows / Linux:** `proxy.py`, `broker.py` and `broker_client.py` are pure Python and don't care about the OS — only the two shell scripts are macOS. Launch your browser with `--remote-debugging-port=9229 --remote-allow-origins=* --disable-backgrounding-occluded-windows --disable-renderer-backgrounding`, then run `python proxy.py` from a startup task. Those backgrounding flags matter: agent tabs are background tabs, and without the flags Chrome throttles a background tab's timers to roughly once a second, which is enough to mount zero rows in a modern SPA. **What the flags do not do is make a hidden tab paint.** `requestAnimationFrame` does not fire in a document whose `visibilityState` is `hidden` — that is Page Visibility behaviour, not throttling, and no flag turns it back on. So a page that renders off timers or fetch callbacks fills in normally in an agent tab, and a page that renders inside a rAF loop (canvas, animation-driven charts) will sit at its initial frame. `Page.captureScreenshot` still returns a real PNG either way, so a screenshot is not proof the page is live. Developed on macOS. **Linux is verified for the browser-level CDP path** ([#1](https://github.com/nicedreamzapp/browser-broker/issues/1)): Ubuntu 26.04 / Chrome 153, two concurrent browser-level clients each saw only its own tabs, and cross-client `Target.attachToTarget` returned `No target with given id found` in both directions. Hidden-tab rendering was measured there too and reproduces on macOS: after 4s a hidden lease tab had fired 0 animation frames while its 100ms timer kept ticking, on both Ubuntu/Chrome 153 and macOS/Brave. Not yet covered there: a logged-in profile, Playwright `connectOverCDP`, the legacy `/json` first-page path, and multi-hour runs. **Windows is untested** — reports welcome.
+**Windows / Linux:** `proxy.py`, `broker.py` and `broker_client.py` are pure Python and don't care about the OS — only the two shell scripts are macOS. Launch your browser with `--remote-debugging-port=9229 --remote-allow-origins=* --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling` (the same flags `launch-browser.sh` uses), then run `python proxy.py` from a startup task. `bb-show`'s fallback and the hook example are macOS only. Those backgrounding flags matter: agent tabs are background tabs, and without the flags Chrome throttles a background tab's timers to roughly once a second, which is enough to mount zero rows in a modern SPA. **What the flags do not do is make a hidden tab paint.** `requestAnimationFrame` does not fire in a document whose `visibilityState` is `hidden` — that is Page Visibility behaviour, not throttling, and no flag turns it back on. So a page that renders off timers or fetch callbacks fills in normally in an agent tab, and a page that renders inside a rAF loop (canvas, animation-driven charts) will sit at its initial frame. `Page.captureScreenshot` still returns a real PNG either way, so a screenshot is not proof the page is live. Developed on macOS. **Linux is verified for the browser-level CDP path** ([#1](https://github.com/nicedreamzapp/browser-broker/issues/1)): Ubuntu 26.04 / Chrome 153, two concurrent browser-level clients each saw only its own tabs, and cross-client `Target.attachToTarget` returned `No target with given id found` in both directions. Hidden-tab rendering was measured there too and reproduces on macOS: after 4s a hidden lease tab had fired 0 animation frames while its 100ms timer kept ticking, on both Ubuntu/Chrome 153 and macOS/Brave. Not yet covered there: a logged-in profile, Playwright `connectOverCDP`, the legacy `/json` first-page path, and multi-hour runs. **Windows is untested** — reports welcome.
 
 ---
 
-## 🔒 Security
+## <a name="security"></a>🔒 Security
 
 Localhost only, no auth. Anything that can reach `127.0.0.1:9223` can drive your logged-in browser — which is already true of `127.0.0.1:9222` the moment you enable remote debugging. Don't expose either.
 
 ---
 
-## 📊 Status
+## <a name="status"></a>📊 Status
 
-Built in one night and proven with four tests: a leased tab loading Gmail authenticated while the human's visible tab sat on a different account; two agents running concurrently on separate targets; a simulated agent crash whose lease expired and was reclaimed; the human's tabs untouched throughout. Two production agents — a Yahoo inbox sweeper and a LinkedIn notification reaper — run on it daily, with a fallback to raw CDP if the broker is down.
+Built in one night and proven with four manual tests: a leased tab loading Gmail authenticated while the human's visible tab sat on a different account; two agents running concurrently on separate targets; a simulated agent crash whose lease expired and was reclaimed; the human's tabs untouched throughout. Those runs are not checked in as a test suite; the repo has no automated tests yet.
 
 Not yet built: a lane router that skips the browser entirely when a job is really an API call, and per-domain serialization so two agents never hammer one site as the same user.
 
