@@ -247,13 +247,14 @@ class Stage:
         self.url = None
         self.purpose = None
         self.until = 0
-        self.tab = None          # the one tab the stage keeps current
+        self.tabs = {}           # owner -> that owner's stage tab; nobody closes another's
 
     def state(self):
         left = round(max(0.0, self.until - time.time()), 1)
         return {"held_by": self.holder if left else None, "showing": self.url if left else None,
                 "purpose": self.purpose if left else None, "seconds_left": left,
-                "tab": (self.tab or "")[:12] or None}
+                "tab": (self.tabs.get(self.holder) or "")[:12] or None,
+                "tabs": {o: t[:12] for o, t in self.tabs.items()}}
 
     async def _front(self, tid):
         """Bring the page, and on macOS the app, to the front. Exactly once.
@@ -289,20 +290,23 @@ class Stage:
 
         # Matt's rule, 2026-09-16: re-showing a page closes the old tab first, so
         # there is never a row of half-stale copies of the same page to pick from.
-        # Only ever the stage's own tab -- a tab the human opened is not ours.
-        if self.tab:
+        # Only ever THIS OWNER's previous stage tab. 2026-10-02: the stage kept one
+        # tab for everybody, so each agent's show closed the page another agent had
+        # just put in front of Matt (page-audit and email-session ate each other's
+        # tabs every few minutes). A tab the human opened is never ours either.
+        prev = self.tabs.pop(owner, None)
+        if prev:
             try:
-                await self.up.send("Target.closeTarget", targetId=self.tab)
+                await self.up.send("Target.closeTarget", targetId=prev)
             except Exception:
                 pass
-            self.tab = None
 
         res = await self.up.send("Target.createTarget", url=url, background=False)
-        self.tab = res["targetId"]
-        await self._front(self.tab)
+        self.tabs[owner] = res["targetId"]
+        await self._front(self.tabs[owner])
         log(f"stage -> {owner}: {url} ({purpose or 'no purpose given'}), held {dwell}s")
         asyncio.create_task(self._decay(mine, dwell))
-        return {"shown": url, "target_id": self.tab, "held_for": dwell, "owner": owner}
+        return {"shown": url, "target_id": self.tabs[owner], "held_for": dwell, "owner": owner}
 
     async def _decay(self, serial, dwell):
         await asyncio.sleep(dwell)
