@@ -5,3 +5,5 @@ launchd.err
 launchd.out
 proxy-test.out
 proxy-test.log
+proxy.err
+windows/pythonw.txt
