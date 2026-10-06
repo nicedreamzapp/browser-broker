@@ -10,3 +10,6 @@ windows/pythonw.txt
 .brave-cdp-guard.last
 brave-cdp-guard.log
 *.bak-*
+tabs.json
+tabs.json.tmp
+broker.log.1

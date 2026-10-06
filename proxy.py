@@ -20,7 +20,7 @@ Identity comes for free from the connection:
     long as it stays connected; its tabs are released when it goes away.
   * a legacy HTTP client (GET /json, PUT /json/new, then a page websocket)
     claims a tab by attaching to it; the tab is released when the page socket
-    closes.
+    closes. A pool tab is handed to one /json caller and one page socket only.
   * the REST lease API on 9223 (broker_client.py) still works and is the way
     to hold a tab across reconnects, with a TTL.
 
@@ -33,8 +33,12 @@ keep rendering because the browser is launched with backgrounding disabled
 
 Ownership rule, deliberately dumb: this proxy can only hand out tabs it
 created. It never enumerates, attaches to, or closes anything else.
+
+Browser-wide commands that would hit the human (Browser.close, Browser.crash,
+Browser.setWindowBounds) are swallowed too. Puppeteer's browser.close() sends
+Browser.close, and through a plain CDP port that quits the human's whole browser.
 """
-import asyncio, json, os, sys, time, uuid, threading, subprocess
+import asyncio, concurrent.futures, json, os, stat, sys, time, uuid, threading, subprocess
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
@@ -42,6 +46,10 @@ from urllib.parse import urlparse, parse_qs, unquote
 import websockets, logging
 if os.environ.get("BROKER_DEBUG"):
     logging.basicConfig(level=logging.DEBUG, format="%(name)s %(message)s")
+else:
+    # Handshake failures from port probes printed a full traceback each, and grew
+    # launchd.err to 28 MB on the M5 (2026-10-06). They are noise, not errors.
+    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.server import serve as ws_serve
 from websockets.http11 import Response
@@ -56,6 +64,15 @@ HEARTBEAT_EVERY = int(os.environ.get("BROKER_HEARTBEAT", 3600))
 LOG = os.path.expanduser(os.environ.get("BROKER_LOG",
       os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker.log")))
 FOCUS_STEALERS = {"Target.activateTarget", "Page.bringToFront"}
+# Commands that act on the human's browser as a whole. Answered with success and
+# never forwarded. Browser.close is the one that bit: Puppeteer's browser.close()
+# sends it, and it quit Matt's whole Brave, every window and tab.
+BROWSER_KILLERS = {"Browser.close", "Browser.crash", "Browser.crashGpuProcess",
+                   "Browser.setWindowBounds"}
+LOG_MAX = 5 * 1024 * 1024          # broker.log rolls to broker.log.1 past this
+STDIO_MAX = 10 * 1024 * 1024       # launchd.err / proxy.err get emptied past this
+STATE = os.path.join(os.path.dirname(os.path.abspath(LOG)), "tabs.json")
+POOL_HOLD = 10                     # seconds a listed pool tab is reserved for its /json caller
 BROWSER_APP = os.environ.get("BROWSER_APP", "Brave Browser")   # for the one allowed activate
 STAGE_DWELL = int(os.environ.get("BROKER_STAGE_DWELL", 20))    # seconds a shown page is protected
 STAGE_WAIT = int(os.environ.get("BROKER_STAGE_WAIT", 30))      # seconds a caller will queue
@@ -64,6 +81,11 @@ STAGE_WAIT = int(os.environ.get("BROKER_STAGE_WAIT", 30))      # seconds a calle
 def log(msg):
     line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
     print(line, flush=True)
+    try:
+        if os.path.getsize(LOG) > LOG_MAX:
+            os.replace(LOG, LOG + ".1")
+    except OSError:
+        pass
     try:
         with open(LOG, "a") as f:
             f.write(line + "\n")
@@ -104,16 +126,25 @@ class Upstream:
         except Exception as e:
             log(f"upstream control socket dropped: {e}")
         self.ws = None
+        # Anyone waiting on a reply would otherwise sit out the full 20s timeout.
+        pending, self._pending = self._pending, {}
+        for fut in pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("browser control socket dropped"))
 
     async def send(self, method, **params):
         async with self._lock:
             if self.ws is None:
                 await self.connect()
         self._id += 1
+        mid = self._id
         fut = asyncio.get_running_loop().create_future()
-        self._pending[self._id] = fut
-        await self.ws.send(json.dumps({"id": self._id, "method": method, "params": params}))
-        m = await asyncio.wait_for(fut, 20)
+        self._pending[mid] = fut
+        try:
+            await self.ws.send(json.dumps({"id": mid, "method": method, "params": params}))
+            m = await asyncio.wait_for(fut, 20)
+        finally:
+            self._pending.pop(mid, None)
         if "error" in m:
             raise RuntimeError(m["error"].get("message"))
         return m.get("result", {})
@@ -135,15 +166,50 @@ class Registry:
         self.tabs = {}      # target_id -> dict(owner, kind, hidden, created, expires, attached, lease_id)
         self.loop = None
 
-    async def create(self, owner, url, hidden=True, kind="rest", ttl=None):
+    def _save(self):
+        """Write down which tabs are ours, so a proxy that crashed or restarted
+        can close them next time instead of leaving them in Matt's window with
+        nobody owning them."""
+        try:
+            tmp = STATE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(list(self.tabs), f)
+            os.replace(tmp, STATE)
+        except OSError:
+            pass
+
+    async def close_leftovers(self):
+        """Startup: close tabs a previous run of this proxy made and never closed.
+        Only IDs from our own record are touched, never anything else."""
+        try:
+            with open(STATE) as f:
+                old = set(json.load(f))
+        except (OSError, ValueError):
+            return
+        try:
+            live = {t["targetId"] for t in (await self.up.send("Target.getTargets")).get("targetInfos", [])}
+        except Exception:
+            return
+        for tid in old & live:
+            try:
+                await self.up.send("Target.closeTarget", targetId=tid)
+            except Exception:
+                pass
+        if old & live:
+            log(f"closed {len(old & live)} tab(s) left over from the last run")
+        self._save()
+
+    async def create(self, owner, url, hidden=True, kind="rest", ttl=None, context=None):
         # A plain background tab in the window that is already open. Matt asked
         # for this on 2026-09-07: parking agent work in its own off-screen window
         # shoved his browser aside every time an agent ran. background=True means
         # it opens behind whatever he is looking at and never takes focus, and
         # the ownership filter below -- not the window -- is what keeps agents
         # out of each other's tabs, so nothing about the isolation changes.
-        res = await self.up.send("Target.createTarget", url=url or "about:blank",
-                                 background=True)
+        args = {"url": url or "about:blank", "background": True}
+        if context:
+            args["browserContextId"] = context
+        res = await self.up.send("Target.createTarget", **args)
         tid = res["targetId"]
         # Register ownership BEFORE parking the window: Chrome tells auto-attached
         # clients about the new target immediately, and their filter must be
@@ -151,7 +217,9 @@ class Registry:
         self.tabs[tid] = {"owner": owner, "kind": kind, "hidden": hidden,
                           "created": time.time(), "attached": 0,
                           "expires": time.time() + (ttl or UNATTACHED_TTL),
-                          "lease_id": uuid.uuid4().hex[:12] if kind == "rest" else None}
+                          "lease_id": uuid.uuid4().hex[:12] if kind == "rest" else None,
+                          "listed_until": 0}
+        self._save()
         log(f"tab {tid[:12]} -> {owner} ({kind}{', hidden' if hidden else ''})")
         return tid
 
@@ -160,12 +228,15 @@ class Registry:
 
     def free_pool(self):
         """Tabs made for legacy /json clients that nobody has attached to yet."""
-        return [t for t, i in self.tabs.items() if i["kind"] == "pool" and i["attached"] == 0]
+        now = time.time()
+        return [t for t, i in self.tabs.items()
+                if i["kind"] == "pool" and i["attached"] == 0 and i["listed_until"] <= now]
 
     async def close(self, tid, why=""):
         info = self.tabs.pop(tid, None)
         if info is None:
             return
+        self._save()
         try:
             await self.up.send("Target.closeTarget", targetId=tid)
         except Exception:
@@ -191,9 +262,11 @@ class Registry:
             live = {t["targetId"] for t in (await self.up.send("Target.getTargets")).get("targetInfos", [])}
         except Exception:
             return
-        for tid in list(self.tabs):
-            if tid not in live:
-                self.tabs.pop(tid, None)
+        gone = [tid for tid in self.tabs if tid not in live]
+        for tid in gone:
+            self.tabs.pop(tid, None)
+        if gone:
+            self._save()
 
     def status(self):
         now = time.time()
@@ -285,6 +358,15 @@ class Stage:
 
         self._serial += 1
         mine = self._serial
+        try:
+            return await self._show_locked(mine, owner, url, purpose, dwell)
+        except BaseException:
+            # A bad URL, Brave being down, or the caller giving up must not leave
+            # the screen locked: every later /show would get 409 until /unstage.
+            self.free(mine)
+            raise
+
+    async def _show_locked(self, mine, owner, url, purpose, dwell):
         self.holder, self.url, self.purpose = owner, url, purpose
         self.until = time.time() + dwell
 
@@ -339,61 +421,127 @@ def _resp(status, reason, body=b"", ctype="application/json"):
                                              ("Connection", "close")]), body)
 
 
-def _json(obj, status=200):
-    return _resp(status, "OK" if status == 200 else "Error", json.dumps(obj, indent=2).encode())
-
-
 async def _pool_entries():
-    """What a legacy client sees on GET /json: only unclaimed tabs we made.
-    Make one if there are none so 'first page' always resolves to something."""
+    """What a legacy client sees on GET /json: one unclaimed tab we made, reserved
+    for this caller for a few seconds so a second caller can't be handed the same
+    one before the first attaches. Made fresh if none is free."""
     free = REG.free_pool()
-    if not free:
-        tid = await REG.create("pool", "about:blank", hidden=True, kind="pool")
-        free = [tid]
-    entries = []
+    tid = free[0] if free else await REG.create("pool", "about:blank", hidden=True, kind="pool")
+    REG.tabs[tid]["listed_until"] = time.time() + POOL_HOLD
+    e = REG.target_info(tid)
     try:
-        infos = {t["targetId"]: t for t in (await UP.send("Target.getTargets")).get("targetInfos", [])}
+        for t in (await UP.send("Target.getTargets")).get("targetInfos", []):
+            if t["targetId"] == tid:
+                e["title"], e["url"] = t.get("title", ""), t.get("url", "")
     except Exception:
-        infos = {}
-    for tid in free:
-        e = REG.target_info(tid)
-        e["title"] = infos.get(tid, {}).get("title", "")
-        e["url"] = infos.get(tid, {}).get("url", "")
-        entries.append(e)
-    return entries
+        pass
+    return [e]
 
 
-async def process_request(connection, request):
-    """HTTP endpoints of the DevTools remote-debugging surface. Return None to
-    let a websocket handshake proceed."""
-    path = request.path
-    if path.startswith("/devtools/"):
-        return None
+async def route_http(method, path):
+    """HTTP endpoints of the DevTools remote-debugging surface.
+    Returns (status line, content type, body bytes)."""
     u = urlparse(path)
     # Playwright asks for /json/version/ with a trailing slash; Chrome tolerates it.
     u = u._replace(path=(u.path.rstrip("/") or "/"))
+    j = lambda obj: ("200 OK", "application/json", json.dumps(obj, indent=2).encode())
     if u.path == "/json/version":
         v = dict(UP.version or {})
         v["Browser"] = (v.get("Browser", "") + " (browser-broker)").strip()
         v["webSocketDebuggerUrl"] = f"ws://127.0.0.1:{LISTEN}/devtools/browser/{uuid.uuid4().hex}"
-        return _json(v)
+        return j(v)
     if u.path in ("/json", "/json/list"):
-        return _json(await _pool_entries())
-    if u.path == "/json/new":
+        return j(await _pool_entries())
+    if u.path == "/json/new":       # Chrome 111+ wants PUT; GET still accepted here
         url = unquote(u.query) if u.query else "about:blank"
         tid = await REG.create("pool", url, hidden=True, kind="pool")
-        return _json(REG.target_info(tid))
+        REG.tabs[tid]["listed_until"] = time.time() + POOL_HOLD
+        return j(REG.target_info(tid))
     if u.path.startswith("/json/activate/"):
-        return _resp(200, "OK", b"Target activated (noop)", "text/plain")
+        return ("200 OK", "text/plain", b"Target activated (noop)")
     if u.path.startswith("/json/close/"):
         tid = u.path.rsplit("/", 1)[-1]
-        if tid in REG.tabs:
+        # only unleased pool tabs: a REST lease or a browser client's tab is not
+        # some other caller's to close just because it knows the id
+        if REG.tabs.get(tid, {}).get("kind") == "pool":
             await REG.close(tid, "client closed it")
-            return _resp(200, "OK", b"Target is closing", "text/plain")
-        return _resp(404, "Not Found")
+            return ("200 OK", "text/plain", b"Target is closing")
+        return ("404 Not Found", "text/plain", b"No such target id")
     if u.path == "/json/protocol":
-        return _json(await UP._http("/json/protocol"))
+        return j(await UP._http("/json/protocol"))
+    return ("404 Not Found", "text/plain", b"Not Found")
+
+
+async def process_request(connection, request):
+    """The inner websocket server only ever sees upgrades (the front door routes
+    plain HTTP itself); anything else is refused."""
+    if request.path.startswith("/devtools/"):
+        return None
     return _resp(404, "Not Found")
+
+
+INNER_PORT = None      # where the websocket server really listens (ephemeral, loopback)
+
+
+async def _splice(r, w):
+    try:
+        while True:
+            data = await r.read(65536)
+            if not data:
+                break
+            w.write(data)
+            await w.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+
+
+async def front_door(reader, writer):
+    """Port 9222. The websockets library refuses any HTTP method but GET before
+    our code runs, so PUT /json/new (what Chrome 111+ clients send) failed. Plain
+    HTTP is answered here; websocket upgrades are piped byte-for-byte to the
+    inner websocket server. A bare port probe just gets closed, quietly."""
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+    except Exception:
+        writer.close()
+        return
+    lines = head.decode("latin-1").split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) < 2:
+        writer.close()
+        return
+    method, path = parts[0].upper(), parts[1]
+    headers = {}
+    for l in lines[1:]:
+        if ":" in l:
+            k, v = l.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    if "websocket" in headers.get("upgrade", "").lower():
+        try:
+            ur, uw = await asyncio.open_connection("127.0.0.1", INNER_PORT)
+        except Exception:
+            writer.close()
+            return
+        uw.write(head)
+        await asyncio.gather(_splice(reader, uw), _splice(ur, writer))
+        return
+    try:
+        status, ctype, body = await route_http(method, path)
+    except Exception as e:
+        status, ctype, body = "500 Internal Server Error", "text/plain", f"{type(e).__name__}: {e}".encode()
+    try:
+        writer.write((f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\n"
+                      f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
 
 
 async def _pump(src, dst, transform=None):
@@ -430,16 +578,24 @@ async def _page_session(client, tid):
     if info is None:
         await client.close(1008, "not your tab")
         return
+    if info["kind"] == "pool" and info["attached"] > 0:
+        await client.close(1008, "tab already in use")   # a pool tab is one client's
+        return
     info["attached"] += 1
     owner = info["owner"]
-    up = await ws_connect(f"ws://127.0.0.1:{UPSTREAM}/devtools/page/{tid}", max_size=None)
+    try:
+        up = await ws_connect(f"ws://127.0.0.1:{UPSTREAM}/devtools/page/{tid}", max_size=None)
+    except Exception as e:
+        info["attached"] -= 1
+        await client.close(1011, f"browser unreachable: {e}")
+        return
 
     async def c2u(raw):
         try:
             m = json.loads(raw)
         except Exception:
             return raw
-        if m.get("method") in FOCUS_STEALERS:
+        if m.get("method") in FOCUS_STEALERS or m.get("method") in BROWSER_KILLERS:
             out = {"id": m.get("id"), "result": {}}
             if "sessionId" in m:
                 out["sessionId"] = m["sessionId"]
@@ -463,8 +619,14 @@ async def _page_session(client, tid):
 async def _browser_session(client):
     """One browser-level client == one owner. It sees only what it created."""
     owner = "ws:" + uuid.uuid4().hex[:8]
-    up = await ws_connect(UP.version["webSocketDebuggerUrl"], max_size=None)
+    try:
+        up = await ws_connect(UP.version["webSocketDebuggerUrl"], max_size=None)
+    except Exception as e:
+        await client.close(1011, f"browser unreachable: {e}")
+        return
     sessions = {}        # sessionId -> targetId (flattened attach)
+    seen = set()         # every target this client was ever shown, so it hears when they close
+    contexts = set()     # browser contexts this client created; disposed when it leaves
     log(f"browser client {owner} connected")
 
     def mine(tid):
@@ -485,6 +647,15 @@ async def _browser_session(client):
                 return mine(tid)
         return False
 
+    async def make(url, context=None):
+        creating["n"] += 1
+        try:
+            tid = await REG.create(owner, url or "about:blank", hidden=True, kind="ws", context=context)
+        finally:
+            creating["n"] -= 1
+        seen.add(tid)
+        return tid
+
     async def reply(m, **body):
         out = {"id": m.get("id"), **body}
         if "sessionId" in m:
@@ -496,19 +667,59 @@ async def _browser_session(client):
             m = json.loads(raw)
         except Exception:
             return raw
+        try:
+            return await _c2u(m, raw)
+        except websockets.ConnectionClosed:
+            raise
+        except Exception as e:
+            # A slow or failed upstream call answers THIS command with an error.
+            # It used to escape the pump and end the session, closing every tab
+            # the client had.
+            if m.get("id") is not None:
+                await reply(m, error={"code": -32000, "message": f"browser-broker: {e}"})
+            return None
+
+    async def _c2u(m, raw):
         method, mid, p = m.get("method"), m.get("id"), m.get("params") or {}
         if method in FOCUS_STEALERS:
             await reply(m, result={})
             return None
+        if method in BROWSER_KILLERS:
+            log(f"{owner} sent {method} -- swallowed, the browser is the human's")
+            await reply(m, result={})
+            if method == "Browser.close":
+                # what the client wanted is to be done; let it go so its close() resolves
+                asyncio.ensure_future(client.close())
+            return None
+        if method == "Target.attachToBrowserTarget":
+            await reply(m, error={"code": -32000, "message": "browser-broker: browser target is not shared"})
+            return None
+        if method == "Target.createBrowserContext":
+            res = await UP.send(method, **p)
+            contexts.add(res.get("browserContextId"))
+            await reply(m, result=res)
+            return None
+        if method == "Target.disposeBrowserContext":
+            if p.get("browserContextId") not in contexts:
+                await reply(m, error={"code": -32000, "message": "Failed to find context with id"})
+                return None
+            contexts.discard(p.get("browserContextId"))
+            for tid, i in list(REG.tabs.items()):
+                if i["owner"] == owner and i.get("context") == p.get("browserContextId"):
+                    REG.tabs.pop(tid, None)
+            REG._save()
+            await reply(m, result=await UP.send(method, **p))
+            return None
         if method == "Target.setAutoAttach":
             auto_attach["on"] = bool(p.get("autoAttach"))
         if method == "Target.createTarget":
-            hidden = not p.get("_visible")
-            creating["n"] += 1
-            try:
-                tid = await REG.create(owner, p.get("url") or "about:blank", hidden=hidden, kind="ws")
-            finally:
-                creating["n"] -= 1
+            ctx = p.get("browserContextId")
+            if ctx and ctx not in contexts:
+                await reply(m, error={"code": -32000, "message": "Failed to find browser context with id " + str(ctx)})
+                return None
+            tid = await make(p.get("url"), ctx)
+            if ctx:
+                REG.tabs[tid]["context"] = ctx
             if auto_attach["on"]:
                 # Playwright/Puppeteer expect attachedToTarget for the new page to
                 # arrive BEFORE the createTarget reply. Chrome guarantees that on
@@ -519,31 +730,21 @@ async def _browser_session(client):
                         break
                     await asyncio.sleep(0.025)
             await reply(m, result={"targetId": tid})
-            # tell a discovering client its new tab exists
-            if discover["on"]:
-                infos = (await UP.send("Target.getTargets")).get("targetInfos", [])
-                for t in infos:
-                    if t["targetId"] == tid:
-                        await client.send(json.dumps({"method": "Target.targetCreated", "params": {"targetInfo": t}}))
             return None
         if method == "Target.getTargets":
             infos = (await UP.send("Target.getTargets")).get("targetInfos", [])
             infos = [t for t in infos if mine(t["targetId"])]
             if not infos:
                 # nothing yet -> give this client one so "first page" works
-                tid = await REG.create(owner, "about:blank", hidden=True, kind="ws")
+                tid = await make("about:blank")
                 infos = [t for t in (await UP.send("Target.getTargets")).get("targetInfos", []) if t["targetId"] == tid]
             await reply(m, result={"targetInfos": infos})
             return None
         if method == "Target.setDiscoverTargets":
+            # Forwarded, so the client gets Chrome's real targetCreated /
+            # targetInfoChanged / targetDestroyed stream; u2c drops everyone else's.
             discover["on"] = bool(p.get("discover"))
-            await reply(m, result={})
-            if discover["on"]:
-                infos = (await UP.send("Target.getTargets")).get("targetInfos", [])
-                for t in infos:
-                    if mine(t["targetId"]):
-                        await client.send(json.dumps({"method": "Target.targetCreated", "params": {"targetInfo": t}}))
-            return None
+            return raw
         if method in ("Target.attachToTarget", "Target.closeTarget", "Target.detachFromTarget",
                       "Browser.getWindowForTarget"):
             tid = p.get("targetId")
@@ -571,6 +772,7 @@ async def _browser_session(client):
             # nested under one of our sessions (OOPIF, worker) or one of our pages
             if sid in sessions or await settled_mine(tid):
                 sessions[child] = tid
+                seen.add(tid)
                 return raw
             try:    # someone else's tab auto-attached to us: let go quietly
                 await up.send(json.dumps({"id": 0, "method": "Target.detachFromTarget",
@@ -586,7 +788,12 @@ async def _browser_session(client):
             return raw if sid in sessions else None       # session traffic: ours or nothing
         if method in ("Target.targetCreated", "Target.targetInfoChanged", "Target.targetDestroyed"):
             tid = p.get("targetId") or (p.get("targetInfo") or {}).get("targetId")
-            if tid in sessions.values() or await settled_mine(tid):
+            # REG forgets a tab the moment it is closed, so its targetDestroyed
+            # would be dropped without `seen` and the client never hears it went.
+            if tid in seen or tid in sessions.values() or await settled_mine(tid):
+                seen.add(tid)
+                if method == "Target.targetDestroyed":
+                    seen.discard(tid)
                 return raw
             return None
         return raw
@@ -598,6 +805,11 @@ async def _browser_session(client):
         await asyncio.gather(_pump(client, up, c2u), _pump(up, client, u2c))
     finally:
         await REG.release_owner(owner)
+        for ctx in contexts:
+            try:
+                await UP.send("Target.disposeBrowserContext", browserContextId=ctx)
+            except Exception:
+                pass
         log(f"browser client {owner} disconnected")
 
 
@@ -619,7 +831,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _run(self, coro, timeout=30):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        try:
+            return fut.result(timeout)
+        except concurrent.futures.TimeoutError:
+            # Without this the coroutine kept running: a /show whose caller had
+            # given up still put the page up later, on top of bb-show's fallback.
+            fut.cancel()
+            raise
 
     def do_GET(self):
         if self.path.startswith("/status"):
@@ -650,7 +869,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          "ws_url": f"ws://127.0.0.1:{LISTEN}/devtools/page/{tid}",
                                          "expires_in": ttl})
             if self.path.startswith("/renew"):
-                for tid, i in REG.tabs.items():
+                for tid, i in list(REG.tabs.items()):
                     if i.get("lease_id") == b.get("lease_id"):
                         i["expires"] = time.time() + int(b.get("ttl", DEFAULT_TTL))
                         return self._reply(200, {"lease_id": b["lease_id"], "expires_in": int(b.get("ttl", DEFAULT_TTL))})
@@ -677,14 +896,30 @@ class ApiHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/adopt"):
                 return self._reply(410, {"error": "adopt is not supported by the proxy — agents only ever get tabs the broker made"})
             self._reply(404, {"error": "no such endpoint"})
+        except concurrent.futures.TimeoutError:
+            self._reply(504, {"error": "browser did not answer in time"})
         except Exception as e:
             self._reply(500, {"error": f"{type(e).__name__}: {e}"})
+
+
+def _trim_stdio():
+    """launchd / Task Scheduler point our stdout and stderr at plain files that
+    nothing rotates. Empty them when they get big."""
+    for fd in (1, 2):
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_size > STDIO_MAX:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
 
 
 async def background():
     last_hb = 0
     while True:
         try:
+            _trim_stdio()
             await REG.reap()
             if time.time() - last_hb > HEARTBEAT_EVERY:
                 s = REG.status()
@@ -696,7 +931,7 @@ async def background():
 
 
 async def main():
-    global REG, UP, STAGE
+    global REG, UP, STAGE, INNER_PORT
     UP = Upstream()
     try:
         await UP.connect()
@@ -705,16 +940,21 @@ async def main():
             f"--remote-debugging-port={UPSTREAM} first (see launch-browser.sh)")
         sys.exit(1)
     REG = Registry(UP)
+    await REG.close_leftovers()
     STAGE = Stage(UP)
     loop = asyncio.get_running_loop()
     ApiHandler.loop = loop
     api = ThreadingHTTPServer(("127.0.0.1", API), ApiHandler)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     asyncio.create_task(background())
-    async with ws_serve(handle_ws, "127.0.0.1", LISTEN, process_request=process_request,
-                        max_size=None, ping_interval=None):
-        log(f"proxy up: CDP on {LISTEN} (upstream browser {UPSTREAM}), lease API on {API}")
-        await asyncio.Future()
+
+    async with ws_serve(handle_ws, "127.0.0.1", 0, process_request=process_request,
+                        max_size=None, ping_interval=None) as inner:
+        INNER_PORT = inner.sockets[0].getsockname()[1]
+        front = await asyncio.start_server(front_door, "127.0.0.1", LISTEN, limit=1 << 20)
+        async with front:
+            log(f"proxy up: CDP on {LISTEN} (upstream browser {UPSTREAM}), lease API on {API}")
+            await asyncio.Future()
 
 
 if __name__ == "__main__":

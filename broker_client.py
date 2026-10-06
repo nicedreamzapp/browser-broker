@@ -80,11 +80,21 @@ def lease(owner, url=None, purpose=None, hidden=True, ttl=TTL):
     stop = threading.Event()
 
     def keepalive():
+        # One failed renew used to end this thread for good, and the tab was
+        # reaped out from under the agent a few minutes later. Keep trying; only
+        # stop when the broker says the lease is gone.
         while not stop.wait(RENEW_EVERY):
-            try:
-                _post("/renew", {"lease_id": g["lease_id"], "ttl": ttl})
-            except Exception:
-                return
+            for attempt in range(5):
+                try:
+                    _post("/renew", {"lease_id": g["lease_id"], "ttl": ttl})
+                    break
+                except HTTPError as e:
+                    if e.code == 404:
+                        return
+                except Exception:
+                    pass
+                if stop.wait(min(2 ** attempt, 15)):
+                    return
 
     threading.Thread(target=keepalive, daemon=True).start()
     tab = Tab(g["ws_url"])

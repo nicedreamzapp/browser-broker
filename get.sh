@@ -32,10 +32,8 @@ else
 fi
 cd "$DIR"
 
-python3 -c "import websocket" 2>/dev/null || {
-  say "installing websocket-client (the only dependency)"
-  pip3 install --quiet websocket-client || die "pip3 install websocket-client failed"
-}
+# Dependencies (websockets 13+ and websocket-client) are installed by install.sh,
+# into the same Python the LaunchAgent will run.
 
 case "$(uname -s)" in
   Darwin)
