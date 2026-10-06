@@ -7,3 +7,6 @@ proxy-test.out
 proxy-test.log
 proxy.err
 windows/pythonw.txt
+.brave-cdp-guard.last
+brave-cdp-guard.log
+*.bak-*
