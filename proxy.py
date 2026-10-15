@@ -869,12 +869,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                                          "ws_url": f"ws://127.0.0.1:{LISTEN}/devtools/page/{tid}",
                                          "expires_in": ttl})
             if self.path.startswith("/renew"):
+                # Pool and browser-client tabs carry lease_id None: a body with no
+                # lease_id must not match them.
+                if not b.get("lease_id"):
+                    return self._reply(400, {"error": "lease_id is required"})
                 for tid, i in list(REG.tabs.items()):
                     if i.get("lease_id") == b.get("lease_id"):
                         i["expires"] = time.time() + int(b.get("ttl", DEFAULT_TTL))
                         return self._reply(200, {"lease_id": b["lease_id"], "expires_in": int(b.get("ttl", DEFAULT_TTL))})
                 return self._reply(404, {"error": "unknown lease"})
             if self.path.startswith("/release"):
+                if not b.get("lease_id"):
+                    return self._reply(400, {"error": "lease_id is required"})
                 for tid, i in list(REG.tabs.items()):
                     if i.get("lease_id") == b.get("lease_id"):
                         self._run(REG.close(tid, "released"))

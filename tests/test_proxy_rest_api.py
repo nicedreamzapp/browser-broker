@@ -105,3 +105,17 @@ def test_api_run_cancels_coroutine_on_timeout(stack):
         pass
     time.sleep(0.7)
     assert finished == []
+
+
+def test_release_without_lease_id_does_not_touch_other_clients_tabs(stack):
+    # Pool and browser-client tabs carry lease_id None. A release or renew that
+    # leaves lease_id out must not match them.
+    c = stack.browser_client()
+    ws_tid = c.call("Target.createTarget", url="about:blank")["result"]["targetId"]
+    _, pool = http("PUT", stack.base + "/json/new")
+    for body in ({}, {"lease_id": None}):
+        for path in ("/release", "/renew"):
+            code, _ = http("POST", stack.api_base + path, body)
+            assert code in (400, 404), (path, body, code)
+    assert ws_tid in stack.reg.tabs and ws_tid in stack.fake.targets
+    assert pool["id"] in stack.reg.tabs and pool["id"] in stack.fake.targets
