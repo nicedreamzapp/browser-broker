@@ -650,6 +650,8 @@ async def _browser_session(client):
             return False
         for _ in range(40):
             await asyncio.sleep(0.025)
+            if tid in seen:
+                return True     # ours, even if the client has already closed it
             if tid in REG.tabs:
                 return mine(tid)
         return False

@@ -215,3 +215,16 @@ def test_status_lists_browser_client_tabs(stack):
     (row,) = s["tabs"]
     assert row["target"] == tid[:12] and row["kind"] == "ws" and row["expires_in"] is None
     assert s["leases"] == []   # browser clients are not REST leases
+
+
+def test_quick_create_then_close_still_reports_created(stack):
+    # A client that closes its new tab right after createTarget returns must
+    # still hear targetCreated for it, then targetDestroyed, in that order.
+    c = stack.browser_client()
+    c.call("Target.setDiscoverTargets", discover=True)
+    tid = c.call("Target.createTarget", url="about:blank")["result"]["targetId"]
+    c.call("Target.closeTarget", targetId=tid)
+    c.drain(0.4)
+    got = [(e["method"], (e["params"].get("targetInfo") or e["params"]).get("targetId"))
+           for e in c.events if e.get("method", "").startswith("Target.target")]
+    assert got == [("Target.targetCreated", tid), ("Target.targetDestroyed", tid)]
