@@ -81,6 +81,20 @@ def test_show_and_stage(client, monkeypatch):
         broker_client.show("https://b.example", owner="other", wait=1)
 
 
+def test_failed_tab_connect_does_not_strand_the_lease(client, monkeypatch):
+    # If the page socket cannot be opened, the lease must still be released and
+    # the keepalive thread must stop renewing it.
+    monkeypatch.setattr(broker_client, "RENEW_EVERY", 0.05)
+
+    def boom(ws_url):
+        raise ConnectionRefusedError("no page socket")
+    monkeypatch.setattr(broker_client, "Tab", boom)
+    with pytest.raises(ConnectionRefusedError):
+        with broker_client.lease("unlucky"):
+            pass
+    assert client.wait_for(lambda: client.reg.tabs == {}), client.reg.tabs
+
+
 # ---- keepalive behaviour against a scripted broker -------------------------
 
 class Scripted(BaseHTTPRequestHandler):
