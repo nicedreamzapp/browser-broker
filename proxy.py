@@ -352,7 +352,14 @@ class Stage:
         wait = STAGE_WAIT if wait is None else int(wait)
         dwell = STAGE_DWELL if dwell is None else int(dwell)
         try:
-            await asyncio.wait_for(self._lock.acquire(), timeout=max(0, wait))
+            if wait <= 0:
+                # wait_for(..., 0) times out even on a free lock, because the
+                # acquire never gets to run. "Don't queue" checks the lock itself.
+                if self._lock.locked():
+                    raise asyncio.TimeoutError
+                await self._lock.acquire()
+            else:
+                await asyncio.wait_for(self._lock.acquire(), timeout=wait)
         except asyncio.TimeoutError:
             raise StageBusy(self.holder, round(max(0.0, self.until - time.time()), 1), self.url)
 

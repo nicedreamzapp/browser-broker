@@ -80,6 +80,14 @@ def test_failed_show_does_not_leave_the_stage_locked(stack):
     assert show(stack, owner="b", url="https://b.example", wait=1, dwell=1)[0] == 200
 
 
+def test_show_with_wait_zero_on_a_free_stage(stack):
+    # wait=0 means "don't queue": it should still show when nobody holds the stage.
+    code, r = show(stack, owner="a", url="https://a.example", wait=0, dwell=30)
+    assert code == 200, r
+    code, r = show(stack, owner="b", url="https://b.example", wait=0)
+    assert code == 409 and r["held_by"] == "a"
+
+
 def test_stale_decay_does_not_free_a_later_holder(stack):
     st = stack.proxy.STAGE
     stack.run(st.show("a", "https://a.example", dwell=1))
